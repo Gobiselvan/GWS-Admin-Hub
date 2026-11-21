@@ -19,3 +19,10 @@ Use this checklist before each deployment. It is a guide, not a substitute for o
 - [ ] Verify no temporary passwords or employee details are committed to GitHub.
 - [ ] Review `AuditLog` and the Admin Console's authoritative audit records.
 - [ ] Document rollback steps and who can disable triggers during an incident.
+
+- [ ] Review v1.2 candidate migration and initialize the added tabs privately.
+- [ ] Register IDs and use administrator approval menu; manual YES is not sufficient.
+- [ ] Check role access to private registry/approval logs; spreadsheets are not tamper-proof.
+- [ ] Verify staged HR requests remain DRAFT and unapproved.
+- [ ] Validate manual license data sources and dates; API integration is not present.
+- [ ] Complete `docs/ISSUES_2_TO_5_IMPLEMENTATION.md` before considering a production rollout.
