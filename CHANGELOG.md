@@ -1,3 +1,11 @@
+## Unreleased — v1.2 development candidate
+
+- Added stable UUID request registration, input snapshots and explicit administrator approval events.
+- Preserved legacy data while appending request-ID columns to supported sheet layouts.
+- Added manual aggregate licensing input with unknown capacity handling; no License Manager API integration.
+- Added review-only HR intake staging, always `Approved=NO` and `Status=DRAFT`.
+- Added offline tests and syntax checks. **Not a tested production release.**
+
 # Changelog
 
 All notable changes are documented here. Versions follow a simple `MAJOR.MINOR.PATCH` convention; publishing a GitHub Release is a separate deliberate step.

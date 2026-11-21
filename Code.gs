@@ -16,6 +16,11 @@ var HUB = Object.freeze({
   PROP_LAST_RUN: 'GWS_LAST_RUN_AT',
   PROP_LAST_STATUS: 'GWS_LAST_RUN_STATUS',
   AUDIT: 'AuditLog',
+  REQUESTS: 'RequestRegistry',
+  APPROVALS: 'ApprovalEvents',
+  HR_INTAKE: 'HR Intake',
+  LICENSE_INPUT: 'LicenseInput',
+  LICENSE_SUMMARY: 'LicenseSummary',
   DASHBOARD: 'Dashboard',
   JOINERS: 'New Joiners',
   SUSPENSIONS: 'SuspensionList',
@@ -24,11 +29,11 @@ var HUB = Object.freeze({
     joiners: [
       'Full Name', 'First Name', 'Last Name', 'Email Prefix',
       'Org Unit Path', 'Recovery Email', 'Approved', 'Status',
-      'Created Email', 'Google User ID', 'Details', 'Processed At'
+      'Created Email', 'Google User ID', 'Details', 'Processed At', 'Request ID'
     ],
     schedule: [
       'Date (DD.MM.YY)', 'Time (hh:mm AM/PM)', 'Mail ID',
-      'Approved', 'Status', 'Log / Details'
+      'Approved', 'Status', 'Log / Details', 'Request ID'
     ]
   }
 });
@@ -38,9 +43,13 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu('⚡ GWS Admin Hub')
     .addItem('1. Configure this Workspace', 'hub_configure')
     .addItem('2. Initialize sheets', 'hub_setupSheets')
+    .addItem('3. Register requests / assign IDs', 'hub_assignRequestIds')
+    .addItem('Approve selected request (admin only)', 'hub_approveSelectedRequest')
+    .addItem('Stage HR intake for review (no provisioning)', 'hub_stageHRIntake')
     .addItem('Check configuration / permissions', 'hub_checkConfiguration')
     .addItem('Refresh operational dashboard', 'hub_refreshDashboard')
     .addItem('Refresh read-only 2SV summary', 'hub_refreshSecuritySummary')
+    .addItem('Refresh manual license snapshot', 'hub_refreshLicenseSnapshot')
     .addSeparator()
     .addSubMenu(SpreadsheetApp.getUi().createMenu('👤 New joiners')
       .addItem('Fill missing names and prefixes', 'prov_fillMissingNames')
@@ -171,9 +180,15 @@ function hub_error_(e) {
 function hub_ensureSheet_(ss, name, headers, headerColor) {
   var sheet = ss.getSheetByName(name);
   if (!sheet) sheet = ss.insertSheet(name);
+  // Append IDs to recognized legacy layouts without shifting existing data.
+  if (sheet.getMaxColumns() < headers.length) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
+  }
   var existing = sheet.getLastRow() ? sheet.getRange(1, 1, 1, headers.length).getDisplayValues()[0] : [];
   if (existing.length && existing.join('|') !== headers.join('|')) {
-    throw new Error(name + ' already contains another layout. Back it up and use a new sheet; no data was overwritten.');
+    var idMigration = (name === HUB.JOINERS || name === HUB.SUSPENSIONS || name === HUB.REACTIVATIONS) &&
+      existing.slice(0, -1).join('|') === headers.slice(0, -1).join('|') && !existing[headers.length-1];
+    if (!idMigration) throw new Error(name + ' contains an unexpected layout. Back it up; no data was overwritten.');
   }
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   sheet.getRange(1, 1, 1, headers.length).setBackground(headerColor)
@@ -197,6 +212,11 @@ function hub_setupSheets() {
     hub_ensureSheet_(ss, HUB.SUSPENSIONS, HUB.HEADERS.schedule, '#a61b1b');
     hub_ensureSheet_(ss, HUB.REACTIVATIONS, HUB.HEADERS.schedule, '#137333');
     hub_ensureSheet_(ss, HUB.AUDIT, ['Timestamp', 'Actor', 'Operation', 'Target Email', 'Outcome', 'Detail'], '#343a40');
+    hub_ensureSheet_(ss, HUB.REQUESTS, ['Request ID', 'Kind', 'Target Email', 'Registered At', 'Registered By'], '#374151');
+    hub_ensureSheet_(ss, HUB.APPROVALS, ['Timestamp', 'Actor', 'Request ID', 'Kind', 'Target Email', 'Decision', 'Approved Snapshot'], '#374151');
+    hub_ensureSheet_(ss, HUB.HR_INTAKE, ['Reference', 'Full Name', 'Org Unit Path', 'Recovery Email', 'Status', 'Details', 'Staged Request ID'], '#4f46e5');
+    hub_ensureSheet_(ss, HUB.LICENSE_INPUT, ['Product', 'SKU', 'Assigned', 'Purchased', 'Source', 'Verified At'], '#1d4ed8');
+    hub_ensureSheet_(ss, HUB.LICENSE_SUMMARY, ['Product', 'SKU', 'Assigned', 'Purchased', 'Available', 'Source', 'Updated At'], '#2563eb');
     ss.toast('Sheets ready. Approve rows explicitly before processing.', 'GWS Admin Hub', 6);
   } finally { lock.releaseLock(); }
 }
@@ -228,7 +248,7 @@ function hub_audit_(operation, targetEmail, outcome, detail, actor) {
 function hub_verifyJoinerRow_(sheet, rowNumber, expectedEmail, config) {
   var r = sheet.getRange(rowNumber, 1, 1, HUB.HEADERS.joiners.length).getDisplayValues()[0];
   if (r[6].trim().toUpperCase() !== 'YES' || r[7].trim().toUpperCase() !== 'IN PROGRESS' ||
-      prov_parse_(r, config).email !== expectedEmail) {
+      prov_parse_(r, config).email !== expectedEmail || !hub_isRegisteredApproval_('JOINER', r[12], expectedEmail, hub_requestSnapshot_('JOINER', r))) {
     throw new Error('Row changed after staging; inspect the request before retrying.');
   }
 }
@@ -302,7 +322,7 @@ function prov_parse_(r, c) {
 
 function prov_collect_(s, c) {
   if (s.getLastRow() < 2) return { approved: [], errors: [] };
-  var values = s.getRange(2, 1, s.getLastRow() - 1, 12).getDisplayValues();
+  var values = s.getRange(2, 1, s.getLastRow() - 1, HUB.HEADERS.joiners.length).getDisplayValues();
   var counts = {};
   values.forEach(function(r) {
     var p = r[3].trim().toLowerCase();
@@ -319,6 +339,7 @@ function prov_collect_(s, c) {
     try {
       if (r[8].trim() || r[9].trim() || r[11].trim()) throw new Error('Existing output; do not reuse this row.');
       var item = prov_parse_(r, c);
+      if (!hub_isRegisteredApproval_('JOINER', r[12], item.email, hub_requestSnapshot_('JOINER', r))) throw new Error('Request ID or authorized approval is missing.');
       if (counts[item.email] > 1) throw new Error('Duplicate email in the sheet.');
       approved.push({ row: row, item: item });
     } catch (e) { errors.push({ row: row, message: hub_error_(e) }); }
@@ -436,7 +457,7 @@ function hub_processSchedule_(mode, c, started) {
   var s = hub_getTab_(targetSheet, HUB.HEADERS.schedule);
   if (s.getLastRow() < 2) return { completed: 0, review: 0 };
   var ss = s.getParent(), timezone = ss.getSpreadsheetTimeZone();
-  var rows = s.getRange(2, 1, s.getLastRow() - 1, 6).getDisplayValues();
+  var rows = s.getRange(2, 1, s.getLastRow() - 1, HUB.HEADERS.schedule.length).getDisplayValues();
   var now = new Date(), completed = 0, review = 0;
   for (var i = 0; i < rows.length; i++) {
     if (Date.now() - started > HUB.RUN_LIMIT_MS) break;
@@ -446,6 +467,7 @@ function hub_processSchedule_(mode, c, started) {
     var outcome = '', detail = '';
     try {
       if (!hub_isDomainEmail_(email, c.domain)) throw new Error('Invalid email for configured Workspace domain.');
+      if (!hub_isRegisteredApproval_(mode === 'suspend' ? 'SUSPEND' : 'REACTIVATE', row[6], email, hub_requestSnapshot_(mode === 'suspend' ? 'SUSPEND' : 'REACTIVATE', row))) throw new Error('Missing registered request or administrator approval.');
       var due = hub_parseScheduledAt_(row[0], row[1], timezone);
       if (due > now) continue;
       if (c.admins.indexOf(email) !== -1) {
@@ -457,8 +479,11 @@ function hub_processSchedule_(mode, c, started) {
         SpreadsheetApp.flush();
         var current = s.getRange(r, 1, 1, HUB.HEADERS.schedule.length).getDisplayValues()[0];
         if (current[2].trim().toLowerCase() !== email ||
+            current[0] !== row[0] || current[1] !== row[1] ||
+            current[6] !== row[6] ||
             current[3].trim().toUpperCase() !== 'YES' ||
-            current[4].trim().toUpperCase() !== 'IN PROGRESS') {
+            current[4].trim().toUpperCase() !== 'IN PROGRESS' ||
+            !hub_isRegisteredApproval_(mode === 'suspend' ? 'SUSPEND' : 'REACTIVATE', row[6], email, hub_requestSnapshot_(mode === 'suspend' ? 'SUSPEND' : 'REACTIVATE', row))) {
           throw new Error('Scheduled row was modified during processing.');
         }
         var user = AdminDirectory.Users.get(email);
@@ -599,7 +624,7 @@ function hub_refreshDashboard() {
       ['Last scheduled check result', p.getProperty(HUB.PROP_LAST_STATUS) || 'Not recorded'],
       ['Dashboard refreshed', new Date()],
       ['2SV report', 'Run Refresh read-only 2SV summary to populate below'],
-      ['License report', 'Not integrated; requires a separate authorized License Manager API integration']
+      ['License report', 'Manual aggregate only; use Refresh manual license snapshot. API integration not enabled.']
     ];
     tab.getRange(1, 1, pairs.length, 2).setValues(pairs);
     tab.getRange('A1:B1').setBackground('#17365d').setFontColor('#ffffff').setFontWeight('bold');

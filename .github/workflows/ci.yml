@@ -24,8 +24,10 @@ jobs:
           node-version: '22'
       - name: Validate Apps Script JavaScript syntax
         run: |
-          cp Code.gs /tmp/gws-code-syntax.js
-          node --check /tmp/gws-code-syntax.js
+          for file in Code.gs Workflow.gs LicenseSnapshot.gs; do
+            cp "$file" /tmp/gws-code-syntax.js
+            node --check /tmp/gws-code-syntax.js
+          done
           node --check tests/test.js
       - name: Run offline validation and guard tests
         run: node tests/test.js

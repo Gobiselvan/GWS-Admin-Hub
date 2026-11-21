@@ -43,3 +43,12 @@ Avoid posting sensitive details in a public issue. Contact the repository mainta
 - The aggregate 2SV report performs only read operations against Directory user records. Validate data completeness and organization/domain scope before making compliance decisions.
 - License reporting is not implemented; do not treat the dashboard as a source of license consumption or billing truth.
 - Offline tests and a passing GitHub CI check do not grant permission to use production Workspace credentials, nor do they prove that the script is safe to deploy without tenant-specific testing.
+
+## v1.2 candidate limitations
+
+- Lifecycle actions require a registered UUID and an administrator approval event matching the input snapshot. Changing a name, organizational unit, email or schedule after approval invalidates that approval.
+- `RequestRegistry`, `ApprovalEvents`, and `AuditLog` are **ordinary private spreadsheet tabs, not immutable or tamper-proof records**. Editors can modify data. Use Admin Console's authoritative audit history for security investigations.
+- Never commit the live request registry, HR intake, approval events, personal information, temporary passwords, or license assignment exports to GitHub.
+- HR staging is review-only and no production HR integration is implemented.
+- License reporting reads manually entered aggregate data only. It does not add the broader License Manager OAuth permission, call the API, or alter user entitlements.
+- Deploy only after completing the sandbox acceptance plan in `docs/ISSUES_2_TO_5_IMPLEMENTATION.md`.
