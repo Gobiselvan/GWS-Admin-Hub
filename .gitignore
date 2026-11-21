@@ -1,0 +1,17 @@
+# Never commit local tenant settings, credential exports or sample employee data
+.env
+.env.*
+!.env.example
+*.csv
+*.xlsx
+*.xls
+*.log
+*.bak
+*.key
+*.pem
+credentials.json
+client_secret*.json
+service-account*.json
+secrets.json
+node_modules/
+.DS_Store
