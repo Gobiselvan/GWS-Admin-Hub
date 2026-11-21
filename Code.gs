@@ -12,6 +12,11 @@ var HUB = Object.freeze({
   PROP_DOMAIN: 'GWS_DOMAIN',
   PROP_ADMINS: 'GWS_ALLOWED_ADMINS',
   PROP_SPREADSHEET: 'GWS_SPREADSHEET_ID',
+  PROP_TRIGGER_OWNER: 'GWS_TRIGGER_OWNER',
+  PROP_LAST_RUN: 'GWS_LAST_RUN_AT',
+  PROP_LAST_STATUS: 'GWS_LAST_RUN_STATUS',
+  AUDIT: 'AuditLog',
+  DASHBOARD: 'Dashboard',
   JOINERS: 'New Joiners',
   SUSPENSIONS: 'SuspensionList',
   REACTIVATIONS: 'ReactivationList',
@@ -34,6 +39,8 @@ function onOpen() {
     .addItem('1. Configure this Workspace', 'hub_configure')
     .addItem('2. Initialize sheets', 'hub_setupSheets')
     .addItem('Check configuration / permissions', 'hub_checkConfiguration')
+    .addItem('Refresh operational dashboard', 'hub_refreshDashboard')
+    .addItem('Refresh read-only 2SV summary', 'hub_refreshSecuritySummary')
     .addSeparator()
     .addSubMenu(SpreadsheetApp.getUi().createMenu('👤 New joiners')
       .addItem('Fill missing names and prefixes', 'prov_fillMissingNames')
@@ -189,6 +196,7 @@ function hub_setupSheets() {
     hub_ensureSheet_(ss, HUB.JOINERS, HUB.HEADERS.joiners, '#17365d');
     hub_ensureSheet_(ss, HUB.SUSPENSIONS, HUB.HEADERS.schedule, '#a61b1b');
     hub_ensureSheet_(ss, HUB.REACTIVATIONS, HUB.HEADERS.schedule, '#137333');
+    hub_ensureSheet_(ss, HUB.AUDIT, ['Timestamp', 'Actor', 'Operation', 'Target Email', 'Outcome', 'Detail'], '#343a40');
     ss.toast('Sheets ready. Approve rows explicitly before processing.', 'GWS Admin Hub', 6);
   } finally { lock.releaseLock(); }
 }
@@ -199,6 +207,30 @@ function hub_getTab_(name, headers) {
     throw new Error('Missing or modified ' + name + ' headers. Initialize sheets (see README).');
   }
   return sheet;
+}
+
+// Audit entries contain metadata only; never record credentials or API tokens.
+// A logging error must not cause an already-performed account action to retry.
+function hub_audit_(operation, targetEmail, outcome, detail, actor) {
+  try {
+    var ss = hub_sheet_();
+    var tab = ss.getSheetByName(HUB.AUDIT);
+    if (!tab) return; // Existing installations must initialize sheets after upgrading.
+    tab.appendRow([new Date(), actor || '', operation, targetEmail || '', outcome,
+      hub_safeText_(detail || '')]);
+  } catch (e) {
+    Logger.log('Audit logging failed; inspect private sheet and execution history.');
+  }
+}
+
+// Verify the exact row immediately before a directory mutation. Do not rely
+// on an earlier in-memory snapshot when a spreadsheet can be edited or sorted.
+function hub_verifyJoinerRow_(sheet, rowNumber, expectedEmail, config) {
+  var r = sheet.getRange(rowNumber, 1, 1, HUB.HEADERS.joiners.length).getDisplayValues()[0];
+  if (r[6].trim().toUpperCase() !== 'YES' || r[7].trim().toUpperCase() !== 'IN PROGRESS' ||
+      prov_parse_(r, config).email !== expectedEmail) {
+    throw new Error('Row changed after staging; inspect the request before retrying.');
+  }
 }
 
 // ── New joiner provisioning ──────────────────────────────────────────────────
@@ -282,7 +314,8 @@ function prov_collect_(s, c) {
   var approved = [], errors = [];
   values.forEach(function(r, i) {
     var row = i + 2, approval = r[6].trim().toUpperCase(), status = r[7].trim().toUpperCase();
-    if (approval !== 'YES' || (status && status !== 'READY')) return;
+    // A blank status is NEVER eligible for account creation.
+    if (approval !== 'YES' || status !== 'READY') return;
     try {
       if (r[8].trim() || r[9].trim() || r[11].trim()) throw new Error('Existing output; do not reuse this row.');
       var item = prov_parse_(r, c);
@@ -333,6 +366,8 @@ function prov_runCreation(passwords) {
       ]]);
       SpreadsheetApp.flush();
       try {
+        // Verify approval, email and staged status before the external request.
+        hub_verifyJoinerRow_(s, rowNum, item.email, c);
         // Avoid overwriting or resetting any existing account, including aliases.
         var user;
         try { user = AdminDirectory.Users.get(item.email); }
@@ -355,10 +390,12 @@ function prov_runCreation(passwords) {
           'Account created. Check licenses in Google Admin Console.', new Date()
         ]]);
         results.push({ email: made.primaryEmail || item.email, password: pw });
+        hub_audit_('CREATE', item.email, 'CREATED', 'User account created.', c.actor);
       } catch (e) {
         // Do not retry automatically: an API timeout may occur after account creation.
         s.getRange(rowNum, 8).setValue('REVIEW REQUIRED');
         s.getRange(rowNum, 11).setValue(hub_error_(e) + ' Check Admin Console before retry.');
+        hub_audit_('CREATE', item.email, 'REVIEW REQUIRED', 'Check Admin Console before retry.', c.actor);
       }
       SpreadsheetApp.flush();
     }
@@ -418,6 +455,12 @@ function hub_processSchedule_(mode, c, started) {
         // Stage status before an external mutation to avoid automatic retries.
         s.getRange(r, 5, 1, 2).setValues([['IN PROGRESS', 'Checking directory account...']]);
         SpreadsheetApp.flush();
+        var current = s.getRange(r, 1, 1, HUB.HEADERS.schedule.length).getDisplayValues()[0];
+        if (current[2].trim().toLowerCase() !== email ||
+            current[3].trim().toUpperCase() !== 'YES' ||
+            current[4].trim().toUpperCase() !== 'IN PROGRESS') {
+          throw new Error('Scheduled row was modified during processing.');
+        }
         var user = AdminDirectory.Users.get(email);
         if (user.isAdmin === true || user.isDelegatedAdmin === true ||
             c.admins.indexOf(String(user.primaryEmail || '').toLowerCase()) !== -1) {
@@ -446,6 +489,7 @@ function hub_processSchedule_(mode, c, started) {
     }
     detail += ' Checked: ' + Utilities.formatDate(new Date(), timezone, 'yyyy-MM-dd HH:mm:ss') + ' (' + timezone + ')';
     s.getRange(r, 5, 1, 2).setValues([[outcome, hub_safeText_(detail)]]);
+    hub_audit_(mode === 'suspend' ? 'SUSPEND' : 'REACTIVATE', email, outcome, detail, c.actor);
     SpreadsheetApp.flush();
   }
   return { completed: completed, review: review };
@@ -463,26 +507,143 @@ function react_processPendingUsers() {
   finally { lock.releaseLock(); }
 }
 
+// Triggers execute as the account that installed them. A stored owner prevents
+// different admins from unknowingly creating duplicate schedules.
 function hub_runScheduledActions() {
-  var c = hub_authorize_(), lock = hub_lock_(), started = Date.now();
+  var c = hub_authorize_();
+  var props = PropertiesService.getScriptProperties();
+  var owner = String(props.getProperty(HUB.PROP_TRIGGER_OWNER) || '').toLowerCase();
+  if (owner && owner !== c.actor) throw new Error('Only the trigger owner may run scheduled actions.');
+  var lock = hub_lock_(), started = Date.now(), summary;
   try {
-    hub_processSchedule_('suspend', c, started);
-    hub_processSchedule_('reactivate', c, started);
-  } finally { lock.releaseLock(); }
+    var susp = hub_processSchedule_('suspend', c, started);
+    var react = hub_processSchedule_('reactivate', c, started);
+    summary = 'Suspended: ' + susp.completed + '; Reactivated: ' + react.completed +
+      '; Review required: ' + (susp.review + react.review);
+    props.setProperty(HUB.PROP_LAST_STATUS, summary);
+  } catch (e) {
+    props.setProperty(HUB.PROP_LAST_STATUS, 'FAILED — check execution logs and review sheets');
+    throw e;
+  } finally {
+    props.setProperty(HUB.PROP_LAST_RUN, new Date().toISOString());
+    lock.releaseLock();
+  }
 }
 
 function hub_installTrigger() {
-  hub_authorize_();
+  var c = hub_authorize_();
   hub_getTab_(HUB.SUSPENSIONS, HUB.HEADERS.schedule);
   hub_getTab_(HUB.REACTIVATIONS, HUB.HEADERS.schedule);
-  hub_removeTrigger();
-  ScriptApp.newTrigger('hub_runScheduledActions').timeBased().everyMinutes(5).create();
-  SpreadsheetApp.getUi().alert('Scheduled checks enabled. They run as the installing administrator, approximately every 5 minutes.');
+  var props = PropertiesService.getScriptProperties();
+  var owner = String(props.getProperty(HUB.PROP_TRIGGER_OWNER) || '').toLowerCase();
+  if (owner && owner !== c.actor) {
+    throw new Error('Scheduled checks are owned by another admin (' + owner + '). Ask that admin to disable their trigger first.');
+  }
+  var lock = hub_lock_();
+  try {
+    // Only the current user's triggers are visible to Apps Script.
+    ScriptApp.getProjectTriggers().forEach(function(t) {
+      if (t.getHandlerFunction() === 'hub_runScheduledActions') ScriptApp.deleteTrigger(t);
+    });
+    ScriptApp.newTrigger('hub_runScheduledActions').timeBased().everyMinutes(5).create();
+    props.setProperty(HUB.PROP_TRIGGER_OWNER, c.actor);
+  } finally { lock.releaseLock(); }
+  SpreadsheetApp.getUi().alert('Scheduled checks installed by ' + c.actor + '. Only this account should own the automation trigger.');
 }
 
 function hub_removeTrigger() {
-  hub_authorize_();
-  ScriptApp.getProjectTriggers().forEach(function(t) {
-    if (t.getHandlerFunction() === 'hub_runScheduledActions') ScriptApp.deleteTrigger(t);
-  });
+  var c = hub_authorize_();
+  var props = PropertiesService.getScriptProperties();
+  var owner = String(props.getProperty(HUB.PROP_TRIGGER_OWNER) || '').toLowerCase();
+  if (owner && owner !== c.actor) throw new Error('Only the trigger owner may disable scheduled checks. Contact ' + owner + '.');
+  var lock = hub_lock_();
+  try {
+    ScriptApp.getProjectTriggers().forEach(function(t) {
+      if (t.getHandlerFunction() === 'hub_runScheduledActions') ScriptApp.deleteTrigger(t);
+    });
+    props.deleteProperty(HUB.PROP_TRIGGER_OWNER);
+  } finally { lock.releaseLock(); }
+}
+
+// Read-only status dashboard. Summary values are computed from the private
+// spreadsheet; no employees or credentials are copied to GitHub.
+function hub_refreshDashboard() {
+  var c = hub_authorize_(), lock = hub_lock_();
+  try {
+    var ss = hub_sheet_();
+    var tab = ss.getSheetByName(HUB.DASHBOARD) || ss.insertSheet(HUB.DASHBOARD);
+    var join = hub_getTab_(HUB.JOINERS, HUB.HEADERS.joiners);
+    var susp = hub_getTab_(HUB.SUSPENSIONS, HUB.HEADERS.schedule);
+    var react = hub_getTab_(HUB.REACTIVATIONS, HUB.HEADERS.schedule);
+    function getRows(sheet, width) {
+      return sheet.getLastRow() > 1
+        ? sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getDisplayValues() : [];
+    }
+    var j = getRows(join, 12), s = getRows(susp, 6), r = getRows(react, 6);
+    var ready = j.filter(function(x){ return x[6].trim().toUpperCase() === 'YES' && x[7].trim().toUpperCase() === 'READY'; }).length;
+    var created = j.filter(function(x){ return x[7].trim().toUpperCase() === 'CREATED'; }).length;
+    var dueSusp = s.filter(function(x){ return x[3].trim().toUpperCase() === 'YES' && x[4].trim().toUpperCase() === 'PENDING'; }).length;
+    var dueReact = r.filter(function(x){ return x[3].trim().toUpperCase() === 'YES' && x[4].trim().toUpperCase() === 'PENDING'; }).length;
+    var reviews = j.concat(s, r).filter(function(x) { return x.some(function(v) { return String(v).trim().toUpperCase() === 'REVIEW REQUIRED'; }); }).length;
+    var p = PropertiesService.getScriptProperties();
+    var pairs = [
+      ['GWS Admin Hub — Operational Dashboard', 'Read-only summary (no live user edits)'],
+      ['Workspace domain', c.domain],
+      ['Approved joiners READY', ready],
+      ['Joiners CREATED', created],
+      ['Approved suspensions PENDING', dueSusp],
+      ['Approved reactivations PENDING', dueReact],
+      ['Rows needing review', reviews],
+      ['Scheduled trigger owner', p.getProperty(HUB.PROP_TRIGGER_OWNER) || 'Not registered'],
+      ['Last scheduled check', p.getProperty(HUB.PROP_LAST_RUN) || 'Not recorded'],
+      ['Last scheduled check result', p.getProperty(HUB.PROP_LAST_STATUS) || 'Not recorded'],
+      ['Dashboard refreshed', new Date()],
+      ['2SV report', 'Run Refresh read-only 2SV summary to populate below'],
+      ['License report', 'Not integrated; requires a separate authorized License Manager API integration']
+    ];
+    tab.getRange(1, 1, pairs.length, 2).setValues(pairs);
+    tab.getRange('A1:B1').setBackground('#17365d').setFontColor('#ffffff').setFontWeight('bold');
+    tab.setColumnWidth(1, 310); tab.setColumnWidth(2, 520);
+    tab.setFrozenRows(1);
+    ss.toast('Operational dashboard refreshed. No accounts modified.', 'GWS Admin Hub', 5);
+  } finally { lock.releaseLock(); }
+}
+
+// Read-only tenant summary. Counts are aggregated; never writes employee lists
+// or individual 2SV statuses into the dashboard. Does NOT modify policies.
+function hub_refreshSecuritySummary() {
+  var c = hub_authorize_(), lock = hub_lock_();
+  try {
+    var ss = hub_sheet_(), tab = ss.getSheetByName(HUB.DASHBOARD);
+    if (!tab) throw new Error('Run Refresh operational dashboard first.');
+    var pageToken, total = 0, enrolled = 0, unenrolled = 0, unknown = 0, enforced = 0, active = 0, suspended = 0, pages = 0;
+    do {
+      var opts = { domain: c.domain, maxResults: 500, projection: 'basic', viewType: 'admin_view' };
+      if (pageToken) opts.pageToken = pageToken;
+      var response = AdminDirectory.Users.list(opts);
+      (response.users || []).forEach(function(u) {
+        if (!hub_isDomainEmail_(String(u.primaryEmail || '').toLowerCase(), c.domain)) return;
+        total++;
+        if (u.suspended) suspended++; else active++;
+        if (u.isEnrolledIn2Sv === true) enrolled++;
+        else if (u.isEnrolledIn2Sv === false) unenrolled++;
+        else unknown++;
+        if (u.isEnforcedIn2Sv === true) enforced++;
+      });
+      pageToken = response.nextPageToken;
+      pages++;
+      if (pages > 20 && pageToken) throw new Error('Report exceeds 10,000 users; use a paginated export workflow.');
+    } while (pageToken);
+    tab.getRange(15, 1, 7, 2).setValues([
+      ['2SV summary refreshed', new Date()],
+      ['Users in configured domain', total],
+      ['2SV enrolled', enrolled],
+      ['2SV not enrolled', unenrolled],
+      ['2SV status unavailable', unknown],
+      ['2SV enforced', enforced],
+      ['Users active / suspended', active + ' / ' + suspended]
+    ]);
+    tab.getRange('A15:B15').setBackground('#137333').setFontColor('#ffffff').setFontWeight('bold');
+    ss.toast('2SV aggregate report refreshed. No user accounts changed.', 'GWS Admin Hub', 5);
+  } finally { lock.releaseLock(); }
 }

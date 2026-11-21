@@ -161,3 +161,31 @@ These tests cover input validation and critical authorization rules. **Passing l
 ## Responsible use
 
 This repository intentionally contains **no actual company domain, company email address, API token, secret, or employee record**. Please review [SECURITY.md](SECURITY.md) before sharing or deploying any fork. Public GitHub visibility **does not** make your operational spreadsheet public: keep your own spreadsheet, deployment credentials and trigger account private.
+
+## What's new in the v1.1 development update
+
+- **Strict provisioning approval:** only rows with both `Approved = YES` and `Status = READY` are eligible; blank statuses are ignored.
+- **Staged-row revalidation:** immediately before invoking the Directory API, the script rereads the request row and checks the expected account and approval state. Do not edit or sort a sheet while it is processing; spreadsheet editing is not transactionally locked.
+- **Private `AuditLog` sheet:** includes timestamp, administrator, operation, affected email, outcome and a sanitized description. Passwords are never logged. Audit logging is best effort; consult Google Admin audit logs for authoritative audit records.
+- **Single-owner trigger registration:** the installing admin is recorded in Script Properties. Other configured administrators cannot install a second trigger through the menu. On a deployment upgraded from an older version, each admin should inspect and remove legacy triggers before registering a single owner, because Apps Script only lists the current user's triggers.
+- **Operational `Dashboard` sheet:** displays counts from the private request tabs, last scheduled run, owner, and results. It does not edit Google Workspace users.
+- **Read-only 2SV summary:** optionally retrieves aggregate 2SV enrollment counts for the configured domain from the Directory API. Does not show employee-level details, enforce policy, or modify accounts. Multi-domain organizations should review the domain filter before interpreting tenant-wide totals.
+- **GitHub Actions:** runs source syntax checks and offline tests on new pushes and pull requests. These are not live integration tests and cannot verify actual Google Workspace permissions or license availability.
+
+### After upgrading an existing installation
+
+1. Review the code diff, make a backup of the bound spreadsheet, and test with noncritical accounts.
+2. Copy the updated `Code.gs` into your bound Apps Script project. Reload the Sheet to refresh its menu.
+3. Run **GWS Admin Hub → Initialize sheets** once. It adds `AuditLog` without erasing existing request data (provided the headers remain compatible).
+4. Check and delete **legacy time-driven triggers** under Apps Script → Triggers for every administrator who previously installed them. Trigger ownership metadata cannot discover triggers owned by other users.
+5. Have the designated automation administrator enable the new five-minute check once.
+6. Run **Refresh operational dashboard**. Optionally run **Refresh read-only 2SV summary** after verifying Directory API access.
+7. Keep the live sheet private; never publish employee rows, operational audits, one-time passwords, or customer-specific settings.
+
+**License metrics:** These are not available yet. License counts require a separate, permission-reviewed License Manager API integration; the dashboard explicitly says *Not integrated* instead of inventing numbers.
+
+**Security summary limitations:** Directory records without a reliable 2SV status should be classified as unknown, not presumed noncompliant. Reports are point-in-time counts, not policy enforcement evidence.
+
+### Testing changes locally and in GitHub
+
+Run `node tests/test.js` with Node.js 22 or later. The tests use API mocks and never call a real Workspace tenant. The `Code checks` GitHub Actions workflow runs the same tests on each pull request and push to `main`. Add manual sandbox-tenant tests and an explicit change approval before deploying updated account-changing code.

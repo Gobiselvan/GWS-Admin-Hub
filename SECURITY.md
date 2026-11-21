@@ -34,3 +34,12 @@ Avoid posting sensitive details in a public issue. Contact the repository mainta
 2. Remove `YES` approval from pending rows; then use the Google Admin Console to verify current user states.
 3. Revoke the script's authorization or remove its access, if required by your incident-response procedure.
 4. Investigate Apps Script **Executions** and Workspace Admin audit logs according to your organization's retention policy.
+
+## v1.1 operational safeguards
+
+- A staged request is reread immediately before a directory operation. This reduces, but cannot eliminate, concurrent spreadsheet-edit races. Restrict edits and avoid reordering rows while operations run.
+- The private `AuditLog` is an operational aid, **not** a substitute for Google Workspace Admin audit records or tamper-resistant centralized logging.
+- New installations register a trigger owner in Script Properties. **Upgrade note:** this metadata cannot reveal triggers created by other administrators before the upgrade; manually remove old triggers from each account first.
+- The aggregate 2SV report performs only read operations against Directory user records. Validate data completeness and organization/domain scope before making compliance decisions.
+- License reporting is not implemented; do not treat the dashboard as a source of license consumption or billing truth.
+- Offline tests and a passing GitHub CI check do not grant permission to use production Workspace credentials, nor do they prove that the script is safe to deploy without tenant-specific testing.
