@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font: 14px system-ui, Arial, sans-serif; padding: 18px; color: #17212e; }
+      .notice { background: #f0f5ff; border-left: 4px solid #2464ad; padding: 12px; line-height: 1.5; }
+      button { border: 0; padding: 10px 16px; border-radius: 6px; cursor: pointer; }
+      #create { background: #165c9b; color: white; font-weight: 700; }
+      #create:disabled { background: #aab3bf; }
+      #result { margin-top: 14px; white-space: pre-wrap; }
+      textarea { box-sizing: border-box; width: 100%; height: 140px; font: 12px monospace; }
+      label { display: block; margin: 14px 0; }
+    </style>
+  </head>
+  <body>
+    <h2>Create approved Workspace users</h2>
+    <div class="notice">
+      <b>This creates real accounts and may consume paid licenses.</b><br>
+      Only rows marked <b>Approved = YES</b> and <b>Status = READY</b> are eligible.<br>
+      Up to 50 accounts per run. Temporary passwords appear <b>once</b> in this dialog,
+      not in the spreadsheet or execution logs. Store them in an approved password manager.
+    </div>
+    <label><input type="checkbox" id="ack"> I reviewed the rows, names, email addresses and OU paths, and authorize account creation.</label>
+    <button id="create" disabled>Create approved accounts</button>
+    <button onclick="google.script.host.close()">Close</button>
+    <div id="result" role="status" aria-live="polite"></div>
+    <div id="credentials" hidden>
+      <p><b>One-time credentials (do not put this list in a shared spreadsheet):</b></p>
+      <textarea id="passwords" readonly spellcheck="false"></textarea>
+      <p>Copy these now. Close the dialog to remove the displayed credentials.</p>
+    </div>
+    <script>
+      const create = document.getElementById('create');
+      const result = document.getElementById('result');
+      const credentials = document.getElementById('credentials');
+      document.getElementById('ack').addEventListener('change', function () {
+        create.disabled = !this.checked;
+      });
+      function sampleCharset(s) {
+        const bytes = new Uint8Array(1);
+        // Rejection sampling avoids modulo bias.
+        const bound = Math.floor(256 / s.length) * s.length;
+        do { crypto.getRandomValues(bytes); } while (bytes[0] >= bound);
+        return s[bytes[0] % s.length];
+      }
+      function password() {
+        const lower = 'abcdefghjkmnpqrstuvwxyz';
+        const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+        const number = '23456789';
+        const symbol = '!#@%';
+        const all = lower + upper + number + symbol;
+        const chars = [sampleCharset(lower), sampleCharset(upper), sampleCharset(number), sampleCharset(symbol)];
+        while (chars.length < 16) chars.push(sampleCharset(all));
+        // Fisher-Yates using browser cryptography.
+        for (let i = chars.length - 1; i > 0; i--) {
+          const buf = new Uint32Array(1);
+          const ceiling = Math.floor(4294967296 / (i + 1)) * (i + 1);
+          do { crypto.getRandomValues(buf); } while (buf[0] >= ceiling);
+          const j = buf[0] % (i + 1);
+          [chars[i], chars[j]] = [chars[j], chars[i]];
+        }
+        return chars.join('');
+      }
+      create.onclick = function () {
+        create.disabled = true;
+        if (!window.crypto || !crypto.getRandomValues) {
+          result.textContent = 'Secure browser random generator is unavailable.';
+          return;
+        }
+        const unique = new Set();
+        while (unique.size < 50) unique.add(password());
+        result.textContent = 'Processing. Do not edit or sort the spreadsheet.';
+        google.script.run
+          .withSuccessHandler(function (data) {
+            result.textContent = `Processed ${data.processed} approved row(s). ` +
+              `Created ${data.created.length} account(s). ` +
+              `Unprocessed ${data.unprocessed}. Review sheet statuses and the Admin Console.`;
+            if (data.created.length) {
+              document.getElementById('passwords').value =
+                data.created.map(x => x.email + '    ' + x.password).join('\n');
+              credentials.hidden = false;
+            }
+          })
+          .withFailureHandler(function (err) {
+            result.textContent = 'Operation failed or was interrupted. Check the Admin Console and sheet statuses before trying again. ' + (err && err.message ? err.message : '');
+          })
+          .prov_runCreation(Array.from(unique));
+      };
+    </script>
+  </body>
+</html>
