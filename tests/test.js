@@ -1,0 +1,118 @@
+/* Local, offline unit tests: no Google Workspace API calls are made. */
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const source = fs.readFileSync(path.join(__dirname, '../Code.gs'), 'utf8');
+const props = {
+  GWS_DOMAIN: 'example.com',
+  GWS_ALLOWED_ADMINS: 'admin@example.com',
+  GWS_SPREADSHEET_ID: 'fake-id'
+};
+let actor = 'admin@example.com';
+let role = { isAdmin: true, isDelegatedAdmin: false };
+let target = { primaryEmail: 'employee@example.com', suspended: false, isAdmin: false, isDelegatedAdmin: false };
+let patches = 0;
+let tabData = [];
+let statusUpdates = [];
+const fakeTab = {
+  getLastRow: () => tabData.length + 1,
+  getParent: () => fakeSS,
+  getRange: (row, col, count, width) => ({
+    getDisplayValues: () => row === 1 ? [context.HUB.HEADERS.schedule] : tabData.map(r => r.slice(col-1,col-1+width)),
+    setValues: vals => {statusUpdates.push({row, col, vals}); return fakeTab;}
+  })
+};
+const fakeSS = {
+  getSheetByName: name => name === 'SuspensionList' ? fakeTab : null,
+  getSpreadsheetTimeZone: () => 'Etc/UTC'
+};
+const context = vm.createContext({
+  console,
+  Date,
+  Set,
+  Object,
+  Array,
+  PropertiesService: { getScriptProperties: () => ({getProperty: k => props[k]}) },
+  Session: { getEffectiveUser: () => ({getEmail: () => actor}) },
+  AdminDirectory: {
+    Users: {
+      get: email => email === actor ? role : target,
+      patch: (_body, _email) => { patches++; return {suspended: _body.suspended}; }
+    }
+  },
+  SpreadsheetApp: {openById: () => fakeSS, flush: () => {}},
+  Utilities: {
+    parseDate: (dateString, timezone) => {
+      assert.equal(timezone, 'Etc/UTC');
+      return new Date(dateString.replace(' ', 'T') + ':00Z');
+    },
+    formatDate: (date, timezone, _format) => {
+      assert.equal(timezone, 'Etc/UTC');
+      return date.toISOString().slice(0,16).replace('T', ' ');
+    }
+  }
+});
+vm.runInContext(source, context, {filename:'Code.gs'});
+
+const run = (name, callback) => {callback(); console.log('PASS', name);};
+run('generic configuration has no real tenant hardcoding', () => {
+  assert.doesNotMatch(source, /blitznow|gobiselvan|@mr_rgs|sugar\.fit/i);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(__dirname,'../appsscript.json'),'utf8')).dependencies.enabledAdvancedServices[0].userSymbol,'AdminDirectory');
+});
+run('Workspace email must match configured domain', () => {
+  assert.equal(context.hub_isDomainEmail_('employee@example.com','example.com'), true);
+  assert.equal(context.hub_isDomainEmail_('employee@otherexample.com','example.com'), false);
+  assert.equal(context.hub_isDomainEmail_('bad@outside.invalid','example.com'), false);
+});
+run('name suggestions are reviewed and safely parsed', () => {
+  assert.deepEqual(Array.from(context.prov_splitFullName_('Sample Person')), ['Sample','Person','sample.person']);
+  assert.throws(() => context.prov_splitFullName_('Single'));
+});
+run('schedule parser rejects invalid dates and times', () => {
+  assert.equal(context.hub_parseScheduledAt_('30.11.26','05:30 PM','Etc/UTC').toISOString(), '2026-11-30T17:30:00.000Z');
+  assert.throws(() => context.hub_parseScheduledAt_('31.02.26','05:30 PM','Etc/UTC'));
+  assert.throws(() => context.hub_parseScheduledAt_('30.11.26','13:30 PM','Etc/UTC'));
+});
+run('authorization requires allowlist and a directory admin role', () => {
+  actor = 'employee@example.com';
+  assert.throws(() => context.hub_authorize_(), /Not authorized/);
+  actor = 'admin@example.com'; role = {isAdmin:false, isDelegatedAdmin:false};
+  assert.throws(() => context.hub_authorize_(), /admin role/);
+  role = {isAdmin:true};
+  assert.equal(context.hub_authorize_().actor, 'admin@example.com');
+});
+run('only explicitly approved new joiners are processed', () => {
+  const rows = [
+    ['Sample Person','Sample','Person','sample.person','/','','YES','READY','','','',''],
+    ['Other Person','Other','Person','other.person','/','','NO','READY','','','','']
+  ];
+  const s = {getLastRow: () => 3,getRange: () => ({getDisplayValues: () => rows})};
+  const r = context.prov_collect_(s, {domain:'example.com'});
+  assert.equal(r.approved.length,1);
+  assert.equal(r.approved[0].item.email,'sample.person@example.com');
+});
+run('scheduled action blocks directory admins without patching', () => {
+  statusUpdates=[]; patches=0;
+  tabData=[['01.01.20','01:00 AM','employee@example.com','YES','PENDING','']];
+  target={primaryEmail:'employee@example.com',suspended:false,isAdmin:true,isDelegatedAdmin:false};
+  context.hub_processSchedule_('suspend',{domain:'example.com',admins:['admin@example.com']},Date.now());
+  assert.equal(patches,0);
+  assert.equal(statusUpdates.at(-1).vals[0][0],'BLOCKED: ADMIN');
+});
+run('scheduled standard user suspension patches once', () => {
+  statusUpdates=[]; patches=0;
+  tabData=[['01.01.20','01:00 AM','employee@example.com','YES','PENDING','']];
+  target={primaryEmail:'employee@example.com',suspended:false,isAdmin:false,isDelegatedAdmin:false};
+  context.hub_processSchedule_('suspend',{domain:'example.com',admins:['admin@example.com']},Date.now());
+  assert.equal(patches,1);
+  assert.equal(statusUpdates.at(-1).vals[0][0],'COMPLETED');
+});
+run('unapproved action never calls Admin Directory patch', () => {
+  statusUpdates=[]; patches=0;
+  tabData=[['01.01.20','01:00 AM','employee@example.com','NO','PENDING','']];
+  context.hub_processSchedule_('suspend',{domain:'example.com',admins:['admin@example.com']},Date.now());
+  assert.equal(patches,0);
+  assert.equal(statusUpdates.length,0);
+});
+console.log('All offline tests passed.');
