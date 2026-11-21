@@ -68,6 +68,12 @@ const context = vm.createContext({
   }
 });
 vm.runInContext(source, context, {filename:'Code.gs'});
+vm.runInContext(fs.readFileSync(path.join(__dirname, '../Workflow.gs'), 'utf8'), context, {filename:'Workflow.gs'});
+vm.runInContext(fs.readFileSync(path.join(__dirname, '../LicenseSnapshot.gs'), 'utf8'), context, {filename:'LicenseSnapshot.gs'});
+const realApprovalValidation = context.hub_isRegisteredApproval_;
+// Earlier lifecycle tests simulate already approved requests. Dedicated tests
+// below exercise real request registry and administrator approval event checks.
+context.hub_isRegisteredApproval_ = () => true;
 
 const run = (name, callback) => {callback(); console.log('PASS', name);};
 run('generic configuration has no real tenant hardcoding', () => {
@@ -186,4 +192,52 @@ run('2SV summary performs only directory reads and writes aggregated counts', ()
     context.AdminDirectory.Users.list=originalList; context.LockService=originalLock;
   }
 });
+
+run('request ID approvals require registry, a matching snapshot and an approval event', () => {
+  context.hub_isRegisteredApproval_ = realApprovalValidation;
+  const rid = 'c25cf0b5-8182-486b-a104-50c2849070ab';
+  const previous = fakeSS.getSheetByName;
+  let approved = true;
+  const headers = {
+    RequestRegistry: ['Request ID','Kind','Target Email','Registered At','Registered By'],
+    ApprovalEvents: ['Timestamp','Actor','Request ID','Kind','Target Email','Decision','Approved Snapshot']
+  };
+  fakeSS.getSheetByName = name => headers[name] ? ({
+    getLastRow: () => 2,
+    getRange: row => ({getDisplayValues: () => row === 1 ? [headers[name]] :
+      [name === 'RequestRegistry'
+        ? [rid,'JOINER','employee@example.com','2026-11-21','admin@example.com']
+        : ['2026-11-21','admin@example.com',rid,'JOINER','employee@example.com',approved?'APPROVED':'REVOKED','snapshotA']]})
+  }) : null;
+  try {
+    assert.equal(context.hub_isRegisteredApproval_('JOINER','', 'employee@example.com','snapshotA'), false);
+    assert.equal(context.hub_isRegisteredApproval_('JOINER',rid, 'employee@example.com','snapshotA'), true);
+    assert.equal(context.hub_isRegisteredApproval_('JOINER',rid, 'employee@example.com','tampered'), false);
+    assert.equal(context.hub_isRegisteredApproval_('JOINER',rid, 'other@example.com','snapshotA'), false);
+    approved = false;
+    assert.equal(context.hub_isRegisteredApproval_('JOINER',rid, 'employee@example.com','snapshotA'), false);
+  } finally {
+    fakeSS.getSheetByName = previous;
+    context.hub_isRegisteredApproval_ = () => true;
+  }
+});
+run('manual aggregate license report validates counts and preserves unknown capacity', () => {
+  const input = [
+    ['Google Workspace','SKU_1','12','20','Admin Console','2026-11-21'],
+    ['Google Workspace','SKU_2','5','','Approved aggregate export','2026-11-21']
+  ];
+  const rows = context.hub_validateLicenseRows_(input);
+  assert.equal(rows[0][4],8);
+  assert.equal(rows[1][3],'UNKNOWN');
+  assert.equal(rows[1][4],'UNKNOWN');
+  assert.throws(() => context.hub_validateLicenseRows_([...input,input[0]]), /Duplicate/);
+  assert.throws(() => context.hub_validateLicenseRows_([['Product','SKU_1','-3','4','Admin Console','2026-11-21']]), /Invalid assigned/);
+  assert.throws(() => context.hub_validateLicenseRows_([['Product','SKU_1','3','4','Admin Console','']]), /Verified At/);
+});
+run('HR staging schema parses fictional input and rejects unsafe references', () => {
+  const item = context.hub_parseHRIntake_(['TEST-100','Sample Employee','/Employees','','READY FOR REVIEW','',''],{domain:'example.com'});
+  assert.equal(item.email,'sample.employee@example.com');
+  assert.throws(() => context.hub_parseHRIntake_(['unsafe name','Sample Employee','/','','','',''],{domain:'example.com'}));
+});
+
 console.log('All offline tests passed.');
