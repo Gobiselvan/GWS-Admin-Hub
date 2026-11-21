@@ -1,0 +1,488 @@
+/**
+ * Google Workspace Admin Hub
+ * Public, configurable Google Apps Script for an administrator-owned Google Sheet.
+ * No organization names, admin email addresses, credentials or tenant IDs in source.
+ *
+ * IMPORTANT: Account changes are real. Read README.md and SECURITY.md before use.
+ */
+
+var HUB = Object.freeze({
+  MAX_NEW_USERS_PER_RUN: 50,
+  RUN_LIMIT_MS: 240000,
+  PROP_DOMAIN: 'GWS_DOMAIN',
+  PROP_ADMINS: 'GWS_ALLOWED_ADMINS',
+  PROP_SPREADSHEET: 'GWS_SPREADSHEET_ID',
+  JOINERS: 'New Joiners',
+  SUSPENSIONS: 'SuspensionList',
+  REACTIVATIONS: 'ReactivationList',
+  HEADERS: {
+    joiners: [
+      'Full Name', 'First Name', 'Last Name', 'Email Prefix',
+      'Org Unit Path', 'Recovery Email', 'Approved', 'Status',
+      'Created Email', 'Google User ID', 'Details', 'Processed At'
+    ],
+    schedule: [
+      'Date (DD.MM.YY)', 'Time (hh:mm AM/PM)', 'Mail ID',
+      'Approved', 'Status', 'Log / Details'
+    ]
+  }
+});
+
+// ── Menu and first-time configuration ────────────────────────────────────────
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('⚡ GWS Admin Hub')
+    .addItem('1. Configure this Workspace', 'hub_configure')
+    .addItem('2. Initialize sheets', 'hub_setupSheets')
+    .addItem('Check configuration / permissions', 'hub_checkConfiguration')
+    .addSeparator()
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('👤 New joiners')
+      .addItem('Fill missing names and prefixes', 'prov_fillMissingNames')
+      .addItem('Validate approved rows (dry run)', 'prov_validatePendingRows')
+      .addItem('Create approved users (confirm)', 'prov_createPendingUsers'))
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('⛔ Suspensions')
+      .addItem('Process due approved suspensions', 'susp_processUserSuspensions'))
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('♻️ Reactivations')
+      .addItem('Process due approved reactivations', 'react_processPendingUsers'))
+    .addSeparator()
+    .addItem('Enable checks every 5 minutes', 'hub_installTrigger')
+    .addItem('Disable scheduled checks', 'hub_removeTrigger')
+    .addToUi();
+}
+
+function hub_configure() {
+  var ui = SpreadsheetApp.getUi();
+  var effective = String(Session.getEffectiveUser().getEmail() || '').toLowerCase().trim();
+  if (!effective) throw new Error('Cannot determine your signed-in account.');
+  var props = PropertiesService.getScriptProperties();
+  var configured = String(props.getProperty(HUB.PROP_ADMINS) || '').toLowerCase()
+    .split(',').map(function(x) { return x.trim(); }).filter(Boolean);
+  if (configured.length && configured.indexOf(effective) === -1) {
+    throw new Error('Only an existing authorized administrator can change configuration.');
+  }
+  var d = ui.prompt('Workspace domain', 'Enter your verified primary domain, e.g. example.com (no @):', ui.ButtonSet.OK_CANCEL);
+  if (d.getSelectedButton() !== ui.Button.OK) return;
+  var domain = String(d.getResponseText()).toLowerCase().trim();
+  if (!/^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
+    throw new Error('Enter a valid Workspace domain, without @ or https://.');
+  }
+  if (!effective.endsWith('@' + domain)) {
+    throw new Error('You must configure the domain using an administrator account on that domain.');
+  }
+  // Prove the user is an admin using the tenant directory, not only a sheet entry.
+  hub_requireDirectoryAdmin_(effective);
+  var a = ui.prompt('Authorized administrators',
+    'Comma-separated Workspace admin email addresses. Include your own address. Keep the spreadsheet restricted to these people.',
+    ui.ButtonSet.OK_CANCEL);
+  if (a.getSelectedButton() !== ui.Button.OK) return;
+  var admins = String(a.getResponseText()).toLowerCase().split(',')
+    .map(function(x) { return x.trim(); }).filter(Boolean);
+  if (!admins.length || admins.indexOf(effective) === -1 ||
+      admins.some(function(x) { return !hub_isDomainEmail_(x, domain); })) {
+    throw new Error('Include your own account and use only addresses from @' + domain + '.');
+  }
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('This project must be bound to a Google Sheet.');
+  props.setProperties({
+    GWS_DOMAIN: domain,
+    GWS_ALLOWED_ADMINS: Array.from(new Set(admins)).join(','),
+    GWS_SPREADSHEET_ID: ss.getId()
+  });
+  ui.alert('Configuration saved for this Apps Script project. Next: Initialize sheets.');
+}
+
+function hub_checkConfiguration() {
+  var c = hub_authorize_();
+  var ss = hub_sheet_();
+  SpreadsheetApp.getUi().alert(
+    'Configuration OK.\nDomain: ' + c.domain +
+    '\nAuthorized admin: ' + c.actor +
+    '\nSpreadsheet: ' + ss.getName() +
+    '\nTimezone: ' + ss.getSpreadsheetTimeZone() +
+    '\nDirectory administrator role verified.'
+  );
+}
+
+function hub_config_() {
+  var p = PropertiesService.getScriptProperties();
+  var domain = String(p.getProperty(HUB.PROP_DOMAIN) || '').toLowerCase().trim();
+  var admins = String(p.getProperty(HUB.PROP_ADMINS) || '').toLowerCase().split(',')
+    .map(function(x) { return x.trim(); }).filter(Boolean);
+  var sheetId = p.getProperty(HUB.PROP_SPREADSHEET);
+  if (!domain || !admins.length || !sheetId) {
+    throw new Error('Not configured. Use GWS Admin Hub > Configure this Workspace first.');
+  }
+  return { domain: domain, admins: admins, sheetId: sheetId };
+}
+
+function hub_isDomainEmail_(email, domain) {
+  return /^[a-z0-9][a-z0-9._+\-]*@[a-z0-9.-]+$/.test(email) &&
+    email.toLowerCase().endsWith('@' + domain.toLowerCase());
+}
+
+function hub_requireDirectoryAdmin_(email) {
+  if (typeof AdminDirectory === 'undefined') {
+    throw new Error('Enable Admin SDK Directory advanced service first (see README).');
+  }
+  var record = AdminDirectory.Users.get(email);
+  if (!(record.isAdmin === true || record.isDelegatedAdmin === true)) {
+    throw new Error('The executing account must hold a Google Workspace admin role.');
+  }
+  return record;
+}
+
+function hub_authorize_() {
+  var c = hub_config_();
+  var actor = String(Session.getEffectiveUser().getEmail() || '').toLowerCase().trim();
+  if (!actor || c.admins.indexOf(actor) === -1 || !hub_isDomainEmail_(actor, c.domain)) {
+    throw new Error('Not authorized to operate this Workspace administration project.');
+  }
+  hub_requireDirectoryAdmin_(actor);
+  c.actor = actor;
+  return c;
+}
+
+function hub_sheet_() {
+  return SpreadsheetApp.openById(hub_config_().sheetId);
+}
+
+function hub_lock_() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) throw new Error('Another Admin Hub operation is running.');
+  return lock;
+}
+
+function hub_safeText_(input) {
+  var s = String(input == null ? '' : input).replace(/[\r\n\t]/g, ' ').slice(0, 400);
+  return /^[=+@\-]/.test(s) ? "'" + s : s; // Avoid Sheets formula interpretation.
+}
+
+function hub_error_(e) {
+  // No passwords or raw API response objects in logs or sheet output.
+  return hub_safeText_(String(e && e.message ? e.message : e)).slice(0, 250);
+}
+
+function hub_ensureSheet_(ss, name, headers, headerColor) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  var existing = sheet.getLastRow() ? sheet.getRange(1, 1, 1, headers.length).getDisplayValues()[0] : [];
+  if (existing.length && existing.join('|') !== headers.join('|')) {
+    throw new Error(name + ' already contains another layout. Back it up and use a new sheet; no data was overwritten.');
+  }
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setBackground(headerColor)
+    .setFontColor('#ffffff').setFontWeight('bold').setWrap(true);
+  sheet.setFrozenRows(1);
+  sheet.setRowHeight(1, 44);
+  sheet.setColumnWidths(1, headers.length, 175);
+  sheet.setColumnWidth(headers.length, 420);
+  if (sheet.getMaxRows() > 1) {
+    sheet.getRange(2, 1, sheet.getMaxRows() - 1, Math.min(headers.length, 6)).setNumberFormat('@');
+  }
+  return sheet;
+}
+
+function hub_setupSheets() {
+  hub_authorize_();
+  var ss = hub_sheet_();
+  var lock = hub_lock_();
+  try {
+    hub_ensureSheet_(ss, HUB.JOINERS, HUB.HEADERS.joiners, '#17365d');
+    hub_ensureSheet_(ss, HUB.SUSPENSIONS, HUB.HEADERS.schedule, '#a61b1b');
+    hub_ensureSheet_(ss, HUB.REACTIVATIONS, HUB.HEADERS.schedule, '#137333');
+    ss.toast('Sheets ready. Approve rows explicitly before processing.', 'GWS Admin Hub', 6);
+  } finally { lock.releaseLock(); }
+}
+
+function hub_getTab_(name, headers) {
+  var sheet = hub_sheet_().getSheetByName(name);
+  if (!sheet || sheet.getRange(1, 1, 1, headers.length).getDisplayValues()[0].join('|') !== headers.join('|')) {
+    throw new Error('Missing or modified ' + name + ' headers. Initialize sheets (see README).');
+  }
+  return sheet;
+}
+
+// ── New joiner provisioning ──────────────────────────────────────────────────
+function prov_splitFullName_(full) {
+  var name = String(full || '').trim().replace(/\s+/g, ' ');
+  var parts = name.split(' ');
+  if (parts.length < 2) throw new Error('Use First Name and Last Name columns for single-word names.');
+  var last = parts.pop();
+  var first = parts.join(' ');
+  function slug(v) {
+    return v.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/['’]/g, '');
+  }
+  var prefix = slug(parts[0]) + '.' + slug(last);
+  if (!/^[a-z][a-z0-9.-]{0,63}$/.test(prefix)) {
+    throw new Error('Use a manually reviewed email prefix for this name.');
+  }
+  return [first, last, prefix];
+}
+
+function prov_fillMissingNames_ (sheet, from, through) {
+  if (through < from) return;
+  var values = sheet.getRange(from, 1, through - from + 1, 12).getDisplayValues();
+  values.forEach(function(r, index) {
+    var full = r[0].trim(), status = r[7].trim();
+    if (!full || status || !(!r[1] || !r[2] || !r[3])) return;
+    try {
+      var derived = prov_splitFullName_(full);
+      var fields = [r[1] || derived[0], r[2] || derived[1], r[3] || derived[2]];
+      sheet.getRange(from + index, 2, 1, 3).setValues([fields]);
+    } catch (e) {
+      sheet.getRange(from + index, 11).setValue(hub_error_(e));
+    }
+  });
+}
+
+// Simple trigger: only changes sheet cells; does NOT call the Directory API.
+function onEdit(e) {
+  if (!e || !e.range || e.range.getSheet().getName() !== HUB.JOINERS) return;
+  if (e.range.getColumn() !== 1 || e.range.getLastRow() < 2) return;
+  var sheet = e.range.getSheet();
+  prov_fillMissingNames_(sheet, Math.max(e.range.getRow(), 2), e.range.getLastRow());
+}
+
+function prov_fillMissingNames() {
+  hub_authorize_();
+  var lock = hub_lock_();
+  try {
+    var s = hub_getTab_(HUB.JOINERS, HUB.HEADERS.joiners);
+    if (s.getLastRow() > 1) prov_fillMissingNames_(s, 2, s.getLastRow());
+    s.getParent().toast('Name suggestions generated; review before approving.', 'GWS Admin Hub', 5);
+  } finally { lock.releaseLock(); }
+}
+
+function prov_parse_(r, c) {
+  var first = r[1].trim(), last = r[2].trim(), prefix = r[3].trim().toLowerCase();
+  if (!first || !last || !prefix) throw new Error('First Name, Last Name and Email Prefix are required.');
+  var email = prefix.indexOf('@') === -1 ? prefix + '@' + c.domain : prefix;
+  if (!hub_isDomainEmail_(email, c.domain) || !/^[a-z0-9][a-z0-9._-]*$/.test(email.split('@')[0])) {
+    throw new Error('Invalid email address for the configured domain.');
+  }
+  var ou = r[4].trim() || '/';
+  if (!/^\/(?:[^\r\n]{0,200})$/.test(ou)) throw new Error('Org Unit Path must start with /.');
+  var recovery = r[5].trim();
+  if (recovery && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recovery)) {
+    throw new Error('Recovery Email is invalid.');
+  }
+  return { first: first, last: last, email: email, ou: ou, recovery: recovery };
+}
+
+function prov_collect_(s, c) {
+  if (s.getLastRow() < 2) return { approved: [], errors: [] };
+  var values = s.getRange(2, 1, s.getLastRow() - 1, 12).getDisplayValues();
+  var counts = {};
+  values.forEach(function(r) {
+    var p = r[3].trim().toLowerCase();
+    if (p) {
+      var email = p.indexOf('@') >= 0 ? p : p + '@' + c.domain;
+      counts[email] = (counts[email] || 0) + 1;
+    }
+  });
+  var approved = [], errors = [];
+  values.forEach(function(r, i) {
+    var row = i + 2, approval = r[6].trim().toUpperCase(), status = r[7].trim().toUpperCase();
+    if (approval !== 'YES' || (status && status !== 'READY')) return;
+    try {
+      if (r[8].trim() || r[9].trim() || r[11].trim()) throw new Error('Existing output; do not reuse this row.');
+      var item = prov_parse_(r, c);
+      if (counts[item.email] > 1) throw new Error('Duplicate email in the sheet.');
+      approved.push({ row: row, item: item });
+    } catch (e) { errors.push({ row: row, message: hub_error_(e) }); }
+  });
+  return { approved: approved, errors: errors };
+}
+
+function prov_validatePendingRows() {
+  var c = hub_authorize_();
+  var s = hub_getTab_(HUB.JOINERS, HUB.HEADERS.joiners);
+  var items = prov_collect_(s, c);
+  var detail = items.errors.slice(0, 10).map(function(e) { return 'Row ' + e.row + ': ' + e.message; }).join('\n');
+  SpreadsheetApp.getUi().alert('Approved valid rows: ' + items.approved.length +
+    '\nInvalid approved rows: ' + items.errors.length +
+    '\nNo accounts were created.' + (detail ? '\n\n' + detail : ''));
+}
+
+function prov_createPendingUsers() {
+  hub_authorize_();
+  hub_getTab_(HUB.JOINERS, HUB.HEADERS.joiners);
+  var page = HtmlService.createHtmlOutputFromFile('ProvisionDialog')
+    .setWidth(650).setHeight(540);
+  SpreadsheetApp.getUi().showModalDialog(page, 'Confirm Google Workspace account creation');
+}
+
+function prov_runCreation(passwords) {
+  var c = hub_authorize_();
+  if (!Array.isArray(passwords) || passwords.length !== HUB.MAX_NEW_USERS_PER_RUN ||
+      new Set(passwords).size !== HUB.MAX_NEW_USERS_PER_RUN ||
+      !passwords.every(function(p) { return typeof p === 'string' && p.length === 16 &&
+        /^[A-Za-z0-9!#@%]+$/.test(p) && /[a-z]/.test(p) && /[A-Z]/.test(p) &&
+        /[0-9]/.test(p) && /[!#@%]/.test(p); })) {
+    throw new Error('Password batch must contain unique strong 16-character passwords.');
+  }
+  var lock = hub_lock_();
+  var results = [], skipped = 0, began = Date.now();
+  try {
+    var s = hub_getTab_(HUB.JOINERS, HUB.HEADERS.joiners);
+    var candidates = prov_collect_(s, c).approved.slice(0, HUB.MAX_NEW_USERS_PER_RUN);
+    for (var i = 0; i < candidates.length; i++) {
+      if (Date.now() - began > HUB.RUN_LIMIT_MS) { skipped = candidates.length - i; break; }
+      var rowNum = candidates[i].row, item = candidates[i].item, pw = passwords[i];
+      s.getRange(rowNum, 8, 1, 5).setValues([[
+        'IN PROGRESS', item.email, '', 'Creation attempt started; check Admin Console if interrupted.', new Date()
+      ]]);
+      SpreadsheetApp.flush();
+      try {
+        // Avoid overwriting or resetting any existing account, including aliases.
+        var user;
+        try { user = AdminDirectory.Users.get(item.email); }
+        catch (lookErr) {
+          if (!hub_isNotFound_(lookErr)) throw lookErr;
+        }
+        if (user) throw new Error('Account already exists; review in Admin Console.');
+        var body = {
+          primaryEmail: item.email,
+          name: { givenName: item.first, familyName: item.last },
+          orgUnitPath: item.ou,
+          password: pw,
+          changePasswordAtNextLogin: true
+        };
+        if (item.recovery) body.recoveryEmail = item.recovery;
+        var made = AdminDirectory.Users.insert(body);
+        if (!made || !made.id) throw new Error('No confirmed user ID; check Admin Console.');
+        s.getRange(rowNum, 8, 1, 5).setValues([[
+          'CREATED', made.primaryEmail || item.email, String(made.id),
+          'Account created. Check licenses in Google Admin Console.', new Date()
+        ]]);
+        results.push({ email: made.primaryEmail || item.email, password: pw });
+      } catch (e) {
+        // Do not retry automatically: an API timeout may occur after account creation.
+        s.getRange(rowNum, 8).setValue('REVIEW REQUIRED');
+        s.getRange(rowNum, 11).setValue(hub_error_(e) + ' Check Admin Console before retry.');
+      }
+      SpreadsheetApp.flush();
+    }
+    return {
+      created: results, processed: candidates.length - skipped,
+      unprocessed: skipped, message: 'Credentials are shown once. Store them in an approved password manager.'
+    };
+  } finally { lock.releaseLock(); }
+}
+
+function hub_isNotFound_(e) {
+  var message = String(e && e.message ? e.message : e || '');
+  return /(^|\D)404(\D|$)|not found|resource not found/i.test(message);
+}
+
+// ── Scheduled suspension and reactivation ────────────────────────────────────
+function hub_parseScheduledAt_(dateText, timeText, timezone) {
+  var d = String(dateText || '').trim().match(/^(\d{2})[.\/-](\d{2})[.\/-](\d{2}|\d{4})$/);
+  var t = String(timeText || '').trim().toUpperCase().match(/^(0?[1-9]|1[0-2]):([0-5]\d)\s*(AM|PM)$/);
+  if (!d || !t) throw new Error('Use DD.MM.YY and hh:mm AM/PM (e.g. 30.11.26 / 05:30 PM).');
+  var year = Number(d[3]); if (year < 100) year += 2000;
+  var month = Number(d[2]), day = Number(d[1]);
+  var midnight = new Date(Date.UTC(year, month - 1, day));
+  if (midnight.getUTCFullYear() !== year || midnight.getUTCMonth() !== month - 1 ||
+      midnight.getUTCDate() !== day) throw new Error('Invalid calendar date.');
+  var hours = Number(t[1]) % 12 + (t[3] === 'PM' ? 12 : 0);
+  var canonical = year + '-' + ('0' + month).slice(-2) + '-' + ('0' + day).slice(-2) +
+    ' ' + ('0' + hours).slice(-2) + ':' + t[2];
+  var result = Utilities.parseDate(canonical, timezone, 'yyyy-MM-dd HH:mm');
+  if (!result || Utilities.formatDate(result, timezone, 'yyyy-MM-dd HH:mm') !== canonical) {
+    throw new Error('Time is invalid in the spreadsheet timezone.');
+  }
+  return result;
+}
+
+function hub_processSchedule_(mode, c, started) {
+  var targetSheet = mode === 'suspend' ? HUB.SUSPENSIONS : HUB.REACTIVATIONS;
+  var s = hub_getTab_(targetSheet, HUB.HEADERS.schedule);
+  if (s.getLastRow() < 2) return { completed: 0, review: 0 };
+  var ss = s.getParent(), timezone = ss.getSpreadsheetTimeZone();
+  var rows = s.getRange(2, 1, s.getLastRow() - 1, 6).getDisplayValues();
+  var now = new Date(), completed = 0, review = 0;
+  for (var i = 0; i < rows.length; i++) {
+    if (Date.now() - started > HUB.RUN_LIMIT_MS) break;
+    var row = rows[i], approval = row[3].trim().toUpperCase(), status = row[4].trim().toUpperCase();
+    if (approval !== 'YES' || status !== 'PENDING') continue;
+    var r = i + 2, email = row[2].trim().toLowerCase();
+    var outcome = '', detail = '';
+    try {
+      if (!hub_isDomainEmail_(email, c.domain)) throw new Error('Invalid email for configured Workspace domain.');
+      var due = hub_parseScheduledAt_(row[0], row[1], timezone);
+      if (due > now) continue;
+      if (c.admins.indexOf(email) !== -1) {
+        outcome = 'BLOCKED: ADMIN';
+        detail = 'Protected configured administrator; use Admin Console for admin accounts.';
+      } else {
+        // Stage status before an external mutation to avoid automatic retries.
+        s.getRange(r, 5, 1, 2).setValues([['IN PROGRESS', 'Checking directory account...']]);
+        SpreadsheetApp.flush();
+        var user = AdminDirectory.Users.get(email);
+        if (user.isAdmin === true || user.isDelegatedAdmin === true ||
+            c.admins.indexOf(String(user.primaryEmail || '').toLowerCase()) !== -1) {
+          outcome = 'BLOCKED: ADMIN';
+          detail = 'Directory administrator accounts cannot be changed by this tool.';
+        } else if (!hub_isDomainEmail_(String(user.primaryEmail || '').toLowerCase(), c.domain)) {
+          throw new Error('Account resolved outside the configured domain.');
+        } else if (mode === 'suspend' && user.suspended === true) {
+          outcome = 'ALREADY SUSPENDED'; detail = 'Account was already suspended.';
+        } else if (mode === 'reactivate' && user.suspended === false) {
+          outcome = 'ALREADY ACTIVE'; detail = 'Account was already active.';
+        } else {
+          var next = mode === 'suspend';
+          var updated = AdminDirectory.Users.patch({ suspended: next }, user.id || email);
+          // A patch can succeed even if the API response is ambiguous: do not retry.
+          if (!updated || updated.suspended !== next) {
+            throw new Error('Update was not confirmed. Check Admin Console.');
+          }
+          outcome = 'COMPLETED'; detail = next ? 'Account suspended.' : 'Account reactivated.';
+          completed++;
+        }
+      }
+    } catch (e) {
+      outcome = 'REVIEW REQUIRED'; detail = hub_error_(e) + '. Check Admin Console before re-approving.';
+      review++;
+    }
+    detail += ' Checked: ' + Utilities.formatDate(new Date(), timezone, 'yyyy-MM-dd HH:mm:ss') + ' (' + timezone + ')';
+    s.getRange(r, 5, 1, 2).setValues([[outcome, hub_safeText_(detail)]]);
+    SpreadsheetApp.flush();
+  }
+  return { completed: completed, review: review };
+}
+
+function susp_processUserSuspensions() {
+  var c = hub_authorize_(), lock = hub_lock_();
+  try { hub_processSchedule_('suspend', c, Date.now()); }
+  finally { lock.releaseLock(); }
+}
+
+function react_processPendingUsers() {
+  var c = hub_authorize_(), lock = hub_lock_();
+  try { hub_processSchedule_('reactivate', c, Date.now()); }
+  finally { lock.releaseLock(); }
+}
+
+function hub_runScheduledActions() {
+  var c = hub_authorize_(), lock = hub_lock_(), started = Date.now();
+  try {
+    hub_processSchedule_('suspend', c, started);
+    hub_processSchedule_('reactivate', c, started);
+  } finally { lock.releaseLock(); }
+}
+
+function hub_installTrigger() {
+  hub_authorize_();
+  hub_getTab_(HUB.SUSPENSIONS, HUB.HEADERS.schedule);
+  hub_getTab_(HUB.REACTIVATIONS, HUB.HEADERS.schedule);
+  hub_removeTrigger();
+  ScriptApp.newTrigger('hub_runScheduledActions').timeBased().everyMinutes(5).create();
+  SpreadsheetApp.getUi().alert('Scheduled checks enabled. They run as the installing administrator, approximately every 5 minutes.');
+}
+
+function hub_removeTrigger() {
+  hub_authorize_();
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'hub_runScheduledActions') ScriptApp.deleteTrigger(t);
+  });
+}
