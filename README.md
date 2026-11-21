@@ -189,3 +189,16 @@ This repository intentionally contains **no actual company domain, company email
 ### Testing changes locally and in GitHub
 
 Run `node tests/test.js` with Node.js 22 or later. The tests use API mocks and never call a real Workspace tenant. The `Code checks` GitHub Actions workflow runs the same tests on each pull request and push to `main`. Add manual sandbox-tenant tests and an explicit change approval before deploying updated account-changing code.
+
+## v1.2 development candidate — request approvals, manual licensing and HR staging
+
+**This candidate has not been validated in a live or sandbox Google Workspace tenant. Do not treat it as a production release.** See [implementation and release gates](docs/ISSUES_2_TO_5_IMPLEMENTATION.md). Issues [#2](https://github.com/Gobiselvan/GWS-Admin-Hub/issues/2), [#3](https://github.com/Gobiselvan/GWS-Admin-Hub/issues/3), [#4](https://github.com/Gobiselvan/GWS-Admin-Hub/issues/4), and [#5](https://github.com/Gobiselvan/GWS-Admin-Hub/issues/5) remain open for the unvalidated work.
+
+1. Back up the private spreadsheet and existing Apps Script version. In the bound script, add `Workflow.gs` and `LicenseSnapshot.gs` alongside `Code.gs` and `ProvisionDialog.html`.
+2. Run **Initialize sheets** again. This preserves supported 12/6-column data layouts while appending a **Request ID** column and creating private registry/approval/HR/license tabs.
+3. Complete names and email prefixes; choose **Register requests / assign IDs**. Select a request row and use **Approve selected request**. Manually typing `Approved=YES` is insufficient without a registered ID and matching approval snapshot.
+4. User creation still requires a separate confirmation. Scheduled suspension and reactivation require due, approved requests. Existing entries without registered approvals need review and renewed approval after migration.
+5. For a **manual HR intake demonstration**, enter a unique non-sensitive reference, name, OU and `READY FOR REVIEW` in the `HR Intake` tab, then **Stage HR intake for review**. Staging produces only an unapproved `DRAFT` record; **no account is created**.
+6. For **manual licensing**, enter only aggregate Product, SKU, Assigned, Purchased (optional), Source, and Verified At (`YYYY-MM-DD`) values in private `LicenseInput`, then **Refresh manual license snapshot**. `LicenseSummary` shows `UNKNOWN` capacity when purchased seats aren't known. This is **not** live licensing API access.
+
+No additional licensing OAuth scope has been added. The License Manager API's licensing scope is not read-only; automatic integration requires separate authorization and testing.
